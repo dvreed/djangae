@@ -12,6 +12,12 @@ from datetime import datetime
 from django.conf import settings
 from google.appengine.api import datastore, datastore_errors
 from google.appengine.ext import deferred
+from google.appengine.runtime import DeadlineExceededError
+
+
+class Redefer(Exception):
+    """ Custom exception class to allow triggering of the re-deferring of a processing task. """
+    pass
 
 
 def _mid_string(string1, string2):
@@ -174,6 +180,10 @@ def _find_largest_shard(shards):
 
 
 def shard_query(query, shard_count):
+    """ Given a datastore.Query object and a number of shards, return a list of shards where each
+        shard is a pair of (low_key, high_key).
+        May return fewer than `shard_count` shards in cases where there aren't many entities.
+    """
     OVERSAMPLING_MULTIPLIER = 32  # This value is used in Mapreduce
 
     try:
@@ -296,9 +306,17 @@ class ShardedTaskMarker(datastore.Entity):
 
         datastore.Put(self)
 
-    def run_shard(self, query, shard, operation, operation_method=None):
+    def run_shard(self, query, shard, operation, operation_method=None, offset=0, batch_size=100):
+        """ Given a datastore.Query which does not have any high/low bounds on it, apply the bounds
+            of the given shard (which is a pair of keys), and run either the given `operation`
+            (if it's a function) or the given method of the given operation (if it's an object) on
+            each entity that the query returns, starting at entity `offset`, and redeferring every
+            `batch_size` entities to avoid hitting DeadlineExceededError.
+        """
         if operation_method:
-            operation = getattr(operation, operation_method)
+            function = getattr(operation, operation_method)
+        else:
+            function = operation
 
         marker = datastore.Get(self.key())
         if cPickle.dumps(shard) not in marker[ShardedTaskMarker.RUNNING_KEY]:
@@ -308,8 +326,30 @@ class ShardedTaskMarker(datastore.Entity):
         query["__key__ <"] = shard[1]
         query.Order("__key__")
 
-        for entity in query.Run():
-            operation(entity)
+        num_entities_processed = 0
+        try:
+            results = query.Run(offset=offset, limit=batch_size)
+            for entity in results:
+                function(entity)
+                num_entities_processed += 1
+                if num_entities_processed >= batch_size:
+                    raise Redefer()
+        except (DeadlineExceededError, Redefer):
+            # By keeping track of how many entities we've processed, we can (hopefully) avoid
+            # re-processing entities if we hit DeadlineExceededError by redeferring with the
+            # incremented offset.  But note that if we get crushed by the HARD DeadlineExceededError
+            # before we can redefer, then the whole task will retry and so entities will get
+            # processed twice.
+            deferred.defer(
+                self.run_shard,
+                query,
+                shard,
+                operation,
+                operation_method,
+                offset=offset+num_entities_processed,
+                batch_size=batch_size
+            )
+            return  # This is important!
 
         # Once we've run the operation on all the entities, mark the shard as done
         def txn():
